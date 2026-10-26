@@ -1,0 +1,15 @@
+# Original survey data
+*.csv
+*.xlsx
+*.xls
+
+# Generated analysis outputs
+analysis_outputs/
+
+# RStudio files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Rendered reports
+*.html
