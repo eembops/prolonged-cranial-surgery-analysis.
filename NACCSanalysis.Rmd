@@ -1,0 +1,912 @@
+---
+title: "NACCS analysis"
+author: "E Lusby"
+date: "2024-12-19"
+output: html_document
+---
+```{r setup, include=FALSE}
+# NACCS prolonged cranial surgery service evaluation
+# Reproducible analysis script
+# Input: original survey export 'RAW DATA - naccs.csv' (NOT for public distribution)
+# Output: aggregate summaries only, in 'analysis_outputs/'
+# All durations are minutes. Quartiles use median-of-halves, NOT stats::quantile(type=7).
+
+# 0. Dependencies -------------------------------------------------------------
+# install.packages(c('readr','dplyr','tidyr','stringr','ggplot2','tibble'))
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(tibble)
+dir.create('analysis_outputs', showWarnings = FALSE)
+```
+
+
+```{r import_data, include=FALSE}
+# 1. Import and retain original row identifiers -------------------------------
+source_data <- read_csv('RAW DATA - naccs.csv', show_col_types = FALSE)
+stopifnot(ncol(source_data) == 28L, nrow(source_data) == 145L)
+colnames(source_data) <- c(
+  'submitted_date','hospital','month','procedure','indication',
+  'anticipated_duration','actual_duration','drugs','pharma_prop','other1',
+  'pharma_remi','anaesthesia','other2','patient_factors','surgical_factors',
+  'anaesthetic_factors','other3','scalp_block','planned_postop','actual_postop',
+  'timetowake','hydrocephalus','recoverytime','complications','comments',
+  'formname','created','modified'
+)
+source_data <- source_data %>% mutate(CaseID = row_number())
+```
+
+
+```{r data_cleaning, include=FALSE}
+# 2. Data cleaning and cohort selection --------------------------------------
+# Treat common text representations of missing values as NA.
+clean_na_strings <- function(df) {
+  df %>% mutate(across(where(is.character), function(x) {
+    x <- trimws(x)
+    x[x %in% c('', 'NA', 'N/A', 'na', 'n/a', 'N/a')] <- NA_character_
+    x
+  }))
+}
+
+raw_data <- clean_na_strings(source_data) %>%
+  mutate(
+    anticipated_duration = as.numeric(anticipated_duration),
+    actual_duration = as.numeric(actual_duration),
+    timetowake = suppressWarnings(as.numeric(timetowake)),
+    recoverytime = suppressWarnings(as.numeric(recoverytime))
+  )
+
+# Four cases have missing actual surgical duration.
+# These values are retained as missing and are not imputed.
+# Anticipated duration is retained separately for eligibility assessment.
+missing_actual_ids <- raw_data$CaseID[is.na(raw_data$actual_duration)]
+stopifnot(length(missing_actual_ids) == 4L)
+raw_data <- raw_data %>%
+  mutate(
+    actual_duration_missing = is.na(actual_duration)
+  )
+
+# Exclude cases where both anticipated and actual durations were < 480 min.
+# Retain cases with missing actual duration if anticipated duration >= 480 min.
+
+short_cases <- raw_data %>%
+  filter(
+    !is.na(anticipated_duration),
+    !is.na(actual_duration),
+    anticipated_duration < 480,
+    actual_duration < 480
+  )
+
+stopifnot(nrow(short_cases) == 4L)
+
+raw_data <- raw_data %>%
+  filter(!CaseID %in% short_cases$CaseID)
+
+# Exclude the spinal (non-cranial) procedure identified during data review.
+spinal_cases <- raw_data %>%
+  filter(str_detect(coalesce(procedure, ''),
+                    regex('revision of anterior cervical decompression', ignore_case = TRUE)))
+stopifnot(nrow(spinal_cases) == 1L)
+raw_data <- raw_data %>%
+  filter(!CaseID %in% spinal_cases$CaseID)
+stopifnot(nrow(raw_data) == 140L, n_distinct(raw_data$CaseID) == 140L)
+
+# Do NOT remove a record just because hospital, drugs or anaesthesia is missing.
+# Anonymised hospital labels are for internal analysis only; never export key.
+hospital_levels <- sort(unique(na.omit(raw_data$hospital)))
+raw_data <- raw_data %>%
+  mutate(hospanon = factor(hospital, levels = hospital_levels,
+                          labels = LETTERS[seq_along(hospital_levels)]))
+```
+
+
+```{r summary_functions, include=FALSE}
+# 3. Descriptive statistics helpers ------------------------------------------
+median_halves <- function(x, half = c('lower','upper')) {
+  half <- match.arg(half)
+  x <- sort(x[!is.na(x)])
+  n <- length(x)
+  if (n < 2L) return(NA_real_)
+  h <- floor(n / 2)
+  if (half == 'lower') median(head(x, h)) else median(tail(x, h))
+}
+
+summarise_numeric <- function(df, variable) {
+  x <- df[[variable]]
+  tibble(n_recorded = sum(!is.na(x)),
+         median = if (all(is.na(x))) NA_real_ else median(x, na.rm = TRUE),
+         Q1 = median_halves(x, 'lower'), Q3 = median_halves(x, 'upper'),
+         minimum = if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE),
+         maximum = if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE))
+}
+
+techniques <- c('Desflurane', 'Sevoflurane', 'TIVA')
+known_technique <- raw_data %>% filter(anaesthesia %in% techniques)
+stopifnot(nrow(known_technique) == 139L,
+          sum(known_technique$anaesthesia == 'Desflurane') == 11L,
+          sum(known_technique$anaesthesia == 'Sevoflurane') == 17L,
+          sum(known_technique$anaesthesia == 'TIVA') == 111L,
+          sum(!is.na(known_technique$timetowake)) == 128L)
+```
+
+
+```{r table1, include=FALSE}
+# 4. Manuscript Table 1: duration and emergence by maintenance technique -----
+make_table1 <- function(df) {
+  df %>% group_by(anaesthesia) %>%
+    group_modify(~{
+      duration <- summarise_numeric(.x, 'actual_duration')
+      emergence <- summarise_numeric(.x, 'timetowake')
+      tibble(n = nrow(.x), n_emergence = emergence$n_recorded,
+             duration_median = duration$median, duration_Q1 = duration$Q1,
+             duration_Q3 = duration$Q3, duration_min = duration$minimum,
+             duration_max = duration$maximum,
+             emergence_median = emergence$median, emergence_Q1 = emergence$Q1,
+             emergence_Q3 = emergence$Q3, emergence_min = emergence$minimum,
+             emergence_max = emergence$maximum)
+    }) %>% ungroup()
+}
+
+table1_by_technique <- make_table1(known_technique)
+table1_total <- make_table1(known_technique %>% mutate(anaesthesia = 'Total'))
+table1 <- bind_rows(table1_by_technique, table1_total)
+print(table1, width = Inf)
+write_csv(table1, 'analysis_outputs/table1_duration_emergence.csv')
+# Overall 140-case surgical duration (separate from Table 1's 139-case total).
+overall_140_duration <- summarise_numeric(raw_data, 'actual_duration')
+print(overall_140_duration)
+```
+
+
+```{r descriptive_counts, include=FALSE}
+# 5. Hospital counts, drug use and reported reasons ---------------------------
+# These summaries keep one row per CaseID; avoid splitting rows then using n().
+hospital_counts <- raw_data %>% count(hospanon, name = 'n_cases')
+print(hospital_counts)
+write_csv(hospital_counts, 'analysis_outputs/hospital_counts.csv')
+
+# Split multiple selections into long format and count DISTINCT cases.
+# Comma-separated drug labels include 'morphine, oxycodone'; this split therefore
+# produces a spurious 'oxycodone' token, removed below. Validate against questionnaire.
+drug_counts <- raw_data %>%
+  select(CaseID, drugs) %>%
+  separate_rows(drugs, sep = ',') %>%
+  mutate(drug = str_trim(drugs)) %>%
+  filter(!is.na(drug), drug != '', drug != 'oxycodone') %>%
+  distinct(CaseID, drug) %>% count(drug, name = 'n_cases', sort = TRUE)
+print(drug_counts, n = Inf)
+write_csv(drug_counts, 'analysis_outputs/drug_counts.csv')
+
+reason_counts <- raw_data %>%
+  select(CaseID, anaesthesia, patient_factors, surgical_factors, anaesthetic_factors) %>%
+  pivot_longer(cols = c(patient_factors, surgical_factors, anaesthetic_factors),
+               names_to = 'factor_type', values_to = 'reason') %>%
+  separate_rows(reason, sep = ',') %>%
+  mutate(reason = str_trim(reason)) %>%
+  filter(anaesthesia %in% techniques, !is.na(reason), reason != '') %>%
+  distinct(CaseID, anaesthesia, reason) %>%
+  count(anaesthesia, reason, name = 'n_cases') %>%
+  left_join(known_technique %>% count(anaesthesia, name = 'denominator'),
+            by = 'anaesthesia') %>%
+  mutate(percent = 100 * n_cases / denominator)
+print(reason_counts, n = Inf)
+write_csv(reason_counts, 'analysis_outputs/reasons_for_technique.csv')
+```
+
+
+```{r primary_emergence, include=FALSE}
+# 6. Primary emergence summary ------------------------------------------------
+primary_emergence <- known_technique %>%
+  group_by(anaesthesia) %>%
+  group_modify(~summarise_numeric(.x, 'timetowake')) %>%
+  ungroup()
+print(primary_emergence)
+```
+
+```{r}
+# Figure 1: Anaesthetic practice across participating hospitals --------------
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+
+dir.create("analysis_outputs", showWarnings = FALSE)
+
+technique_order <- c("Desflurane", "Sevoflurane", "TIVA")
+
+technique_colours <- c(
+  "Desflurane"  = "#F8766D",
+  "Sevoflurane" = "#00BA38",
+  "TIVA"        = "#619CFF",
+  "Unknown"     = "#888888"
+)
+
+# FIGURE 1A: Maintenance technique by hospital -------------------------------
+
+hospital_technique <- raw_data %>%
+  mutate(
+    technique = if_else(
+      anaesthesia %in% technique_order,
+      anaesthesia,
+      "Unknown"
+    ),
+    technique = factor(
+      technique,
+      levels = c(technique_order, "Unknown")
+    )
+  ) %>%
+  filter(!is.na(hospanon)) %>%
+  count(hospanon, technique, name = "n_cases") %>%
+  group_by(hospanon) %>%
+  mutate(percent = 100 * n_cases / sum(n_cases)) %>%
+  ungroup()
+
+figure1a <- ggplot(
+  hospital_technique,
+  aes(x = hospanon, y = percent, fill = technique)
+) +
+  geom_col(width = 0.9) +
+  scale_fill_manual(values = technique_colours, drop = FALSE) +
+  scale_y_continuous(
+    limits = c(0, 100),
+    breaks = seq(0, 100, 25),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    x = "Hospital",
+    y = "Cases (%)",
+    fill = "Maintenance technique"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    legend.position = "right"
+  )
+
+print(figure1a)
+
+ggsave(
+  "analysis_outputs/Figure_1a.png",
+  figure1a, width = 10, height = 5.5, dpi = 300
+)
+
+ggsave(
+  "analysis_outputs/Figure_1a.pdf",
+  figure1a, width = 10, height = 5.5
+)
+
+
+# FIGURE 1B: Reasons for maintenance technique -------------------------------
+
+reason_order <- c(
+  "Anaesthetist preference",
+  "Comorbidities",
+  "Duration of surgery",
+  "Elderly",
+  "Facilitate intra-operative neuromonitoring (IONM)",
+  "Obesity",
+  "Theatre efficiency",
+  "Transfer for intra-operative radiology"
+)
+
+reason_colours <- c(
+  "Anaesthetist preference" = "#F8766D",
+  "Comorbidities" = "#D89000",
+  "Duration of surgery" = "#7CAE00",
+  "Elderly" = "#00BF7D",
+  "Facilitate intra-operative neuromonitoring (IONM)" = "#00BFC4",
+  "Obesity" = "#00B0F6",
+  "Theatre efficiency" = "#C77CFF",
+  "Transfer for intra-operative radiology" = "#F564E3"
+)
+
+figure1b_data <- reason_counts %>%
+  filter(reason %in% reason_order) %>%
+  mutate(
+    anaesthesia = factor(anaesthesia, levels = technique_order),
+    reason = factor(reason, levels = reason_order)
+  )
+
+figure1b <- ggplot(
+  figure1b_data,
+  aes(x = anaesthesia, y = percent, fill = reason)
+) +
+  geom_col(
+    position = position_dodge(width = 0.85),
+    width = 0.8
+  ) +
+  scale_fill_manual(values = reason_colours, drop = FALSE) +
+  scale_y_continuous(
+    limits = c(0, 105),
+    breaks = seq(0, 100, 25),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    x = "Maintenance technique",
+    y = "Cases reporting reason (%)",
+    fill = "Reason"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 35, hjust = 1)
+  )
+
+print(figure1b)
+
+ggsave(
+  "analysis_outputs/Figure_1b.png",
+  figure1b, width = 11, height = 6, dpi = 300
+)
+
+ggsave(
+  "analysis_outputs/Figure_1b.pdf",
+  figure1b, width = 11, height = 6
+)
+# Combine Figure 1a and Figure 1b --------------------------------------------
+
+library(patchwork)
+
+# Remove individual titles and add panel labels
+figure1a <- figure1a +
+  labs(title = NULL) +
+  theme(plot.margin = margin(5, 5, 5, 5))
+
+figure1b <- figure1b +
+  labs(title = NULL) +
+  theme(plot.margin = margin(5, 5, 5, 5))
+
+# Combine side by side
+figure1 <- (
+  figure1a + figure1b +
+    plot_layout(
+      ncol = 2,
+      widths = c(1.1, 1.3)
+    )
+) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")"
+  ) &
+  theme(
+    plot.tag = element_text(size = 12, face = "bold"),
+    plot.tag.position = c(0.01, 0.99)
+  )
+
+# Display
+print(figure1)
+
+# Save combined figure
+# Combine Figure 1a and Figure 1b — equal-width panels -----------------------
+
+library(patchwork)
+
+# Figure 1a: retain legend on the right
+figure1a_final <- figure1a +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    axis.text = element_text(size = 9),
+    axis.title = element_text(size = 10),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# Figure 1b: move legend below to free horizontal space
+figure1b_final <- figure1b +
+  guides(
+    fill = guide_legend(ncol = 2, byrow = TRUE)
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 7),
+    axis.text = element_text(size = 9),
+    axis.title = element_text(size = 10),
+    axis.text.x = element_text(angle = 35, hjust = 1),
+    plot.margin = margin(5, 5, 5, 5)
+  )
+
+# Combine with equal panel widths
+figure1 <- (
+  figure1a_final | figure1b_final
+) +
+  plot_layout(
+    widths = c(1, 1)
+  ) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")"
+  ) &
+  theme(
+    plot.tag = element_text(size = 11, face = "bold"),
+    plot.tag.position = c(0.01, 0.99)
+  )
+
+print(figure1)
+
+# Save
+ggsave(
+  "analysis_outputs/Figure_1_combined.pdf",
+  plot = figure1,
+  width = 14,
+  height = 6,
+  units = "in"
+)
+
+ggsave(
+  "analysis_outputs/Figure_1_combined.png",
+  plot = figure1,
+  width = 14,
+  height = 6,
+  units = "in",
+  dpi = 300
+)
+```
+
+
+```{r mixed_sensitivity, include=FALSE}
+# 7. Mixed TIVA / sevoflurane sensitivity analysis ----------------------------
+#
+# Mixed-technique cases were identified using two sources:
+#
+# 1. Structured responses indicating both propofol TCI and sevoflurane.
+# 2. Free-text responses in 'other3' describing sevoflurane use
+#    alongside propofol.
+#
+# All cases identified by either method were included in the
+# mixed-technique sensitivity analysis, irrespective of their
+# recorded predominant maintenance technique.
+#
+# Fifteen cases were identified: 12 through structured responses
+# and three additional cases through free text.
+#
+# The primary analysis retains these cases according to their
+# recorded predominant maintenance technique.
+# The sensitivity analysis excludes them.
+#
+# Case-level adjudication records are retained privately and
+# are not included in public analysis outputs.
+structured_candidates <- raw_data %>%
+  filter(str_detect(coalesce(drugs, ''), fixed('Propofol target controlled infusion (TCI)')),
+         str_detect(coalesce(drugs, ''), regex('Sevoflurane', ignore_case = TRUE)))
+stopifnot(nrow(structured_candidates) == 12L)
+
+# FREE TEXT: low-dose sevoflurane introduced after reduction of propofol.
+free_text_candidates <- raw_data %>%
+  filter(str_detect(coalesce(other3, ''), regex('sevoflurane', ignore_case = TRUE)))
+stopifnot(setequal(free_text_candidates$CaseID, c(39L, 40L, 41L)))
+
+# Include all cases reporting both agents, including CaseID 141.
+# 12 structured candidates + 3 additional free-text cases = 15.
+mixed_case_ids <- sort(unique(c(
+  structured_candidates$CaseID,
+  free_text_candidates$CaseID
+)))
+
+stopifnot(length(mixed_case_ids) == 15L)
+
+mixed_review <- raw_data %>%
+  filter(CaseID %in% c(mixed_case_ids, 141L)) %>%
+  transmute(CaseID, anaesthesia, in_structured = CaseID %in% structured_candidates$CaseID,
+            in_other3 = CaseID %in% free_text_candidates$CaseID,
+            excluded_in_provisional_analysis = CaseID %in% mixed_case_ids)
+print(mixed_review, n = Inf)
+# Do not publish individual-level free-text or patient-level exports.
+
+mixed_sensitivity <- known_technique %>%
+  filter(!CaseID %in% mixed_case_ids,
+         anaesthesia %in% c('TIVA', 'Sevoflurane')) %>%
+  group_by(anaesthesia) %>%
+  group_modify(~bind_cols(tibble(n = nrow(.x)), summarise_numeric(.x, 'timetowake'))) %>%
+  ungroup()
+print(mixed_sensitivity, width = Inf)
+write_csv(mixed_sensitivity, 'analysis_outputs/sensitivity_mixed_technique.csv')
+```
+
+
+```{r duration_sensitivity, include=FALSE}
+# 8. Unexpectedly prolonged cases sensitivity analysis -----------------------
+# Anticipated < 480 min, actual >= 480 min. >= rather than > matches current analysis.
+unexpectedly_prolonged <- known_technique %>%
+  filter(anticipated_duration < 480, actual_duration >= 480)
+stopifnot(nrow(unexpectedly_prolonged) == 14L)
+print(unexpectedly_prolonged %>% count(anaesthesia))
+# Expected excluded: Desflurane 2, Sevoflurane 3, TIVA 9.
+
+duration_sensitivity <- known_technique %>%
+filter(!CaseID %in% unexpectedly_prolonged$CaseID)  %>%
+  group_by(anaesthesia) %>%
+  group_modify(~bind_cols(tibble(n = nrow(.x)), summarise_numeric(.x, 'timetowake'))) %>%
+  ungroup()
+print(duration_sensitivity, width = Inf)
+write_csv(duration_sensitivity, 'analysis_outputs/sensitivity_unexpected_duration.csv')
+# Expected: Desflurane n=9, recorded=9, median 8, Q1 7, Q3 10.5;
+# Sevoflurane n=14, recorded=13, median 25, Q1 10, Q3 52.5;
+# TIVA n=102, recorded=93, median 15, Q1 9.5, Q3 22.5.
+```
+
+```{r}
+# TABLE S1: Centre-level case capture ----------------------------------------
+
+library(dplyr)
+library(tibble)
+library(readr)
+
+table_s1 <- tribble(
+  ~Hospital_ID, ~Cases_Submitted, ~Eligible_Confirmed,
+  "A",   1, NA_real_,
+  "B",   6, 6,
+  "C",   2, 2,
+  "D",  21, 21,
+  "E",   6, 7,
+  "F",  10, 10,
+  "G",  16, 16,
+  "H",   1, 1,
+  "I",   6, 8,
+  "J",   6, 6,
+  "K",   3, 3,
+  "L",   4, 6,
+  "M",   2, 2,
+  "N",   1, 1,
+  "O",   3, 3,
+  "P",   8, 12,
+  "Q",   1, NA_real_,
+"R",  2, 2,
+"S",  1, 1,
+"T", 29, 29,
+"U",  4, NA_real_,
+"V",  4, 5,
+"W",  2, 2,
+"X",  0, 0,
+"Y",  0, 0,
+"Z",  0, 0,
+"AA", 0, 0
+) %>%
+  mutate(
+    Case_Capture_Percent = if_else(
+      !is.na(Eligible_Confirmed) & Eligible_Confirmed > 0,
+      round(100 * Cases_Submitted / Eligible_Confirmed, 1),
+      NA_real_
+    )
+  )
+
+print(table_s1, n = Inf)
+
+write_csv(
+  table_s1,
+  "analysis_outputs/Table_S1_case_capture.csv"
+)
+# Verify centre-level counts against eligible case-level data
+
+centre_audit <- raw_data %>%
+  filter(!is.na(hospanon)) %>%
+  count(Hospital_ID = as.character(hospanon),
+        name = "Actual_Count") %>%
+  full_join(
+    table_s1 %>%
+      select(Hospital_ID, Cases_Submitted),
+    by = "Hospital_ID"
+  ) %>%
+  mutate(
+    Actual_Count = replace_na(Actual_Count, 0L),
+    difference = Actual_Count - Cases_Submitted
+  )
+
+stopifnot(
+  nrow(raw_data) == 140L,
+  sum(is.na(raw_data$hospanon)) == 1L,
+  sum(table_s1$Cases_Submitted) == 139,
+  all(centre_audit$difference == 0)
+)
+
+message("Centre-level case counts verified.")
+# Overall case capture: exclude incomplete and missing denominator data
+overall_capture <- table_s1 %>%
+  filter(
+    !Hospital_ID %in% c("A", "I", "Q", "U"),
+    !is.na(Eligible_Confirmed),
+    Eligible_Confirmed > 0
+  ) %>%
+  summarise(
+    cases_submitted = sum(Cases_Submitted),
+    eligible_confirmed = sum(Eligible_Confirmed),
+    capture_percent = round(
+      100 * cases_submitted / eligible_confirmed, 1
+    )
+  )
+
+print(overall_capture)
+```
+```{r}
+# TABLE S2: Other drugs administered and emergence ----------------------------
+
+additional_drug_pattern <- paste(
+  c(
+    "long-acting opioid",
+    "morphine",
+    "oxycodone",
+    "benzodiazepine",
+    "clonidine",
+    "dexmedetomidine"
+  ),
+  collapse = "|"
+)
+
+table_s2_data <- known_technique %>%
+  mutate(
+    additional_drugs = if_else(
+      str_detect(
+        coalesce(drugs, ""),
+        regex(additional_drug_pattern, ignore_case = TRUE)
+      ),
+      "Any specified drug",
+      "None of specified drugs"
+    )
+  )
+
+table_s2 <- table_s2_data %>%
+  group_by(anaesthesia, additional_drugs) %>%
+  group_modify(~bind_cols(
+    tibble(n = nrow(.x)),
+    summarise_numeric(.x, "timetowake")
+  )) %>%
+  ungroup()
+
+print(table_s2, width = Inf)
+
+write_csv(
+  table_s2,
+  "analysis_outputs/Table_S2_additional_drugs_emergence.csv"
+)
+```
+```{r}
+# FIGURE S1: Number of cases submitted by participating centre ---------------
+
+figure_s1_data <- table_s1 %>%
+  filter(Cases_Submitted > 0) %>%
+  arrange(Cases_Submitted, Hospital_ID) %>%
+  mutate(
+    Hospital_ID = factor(Hospital_ID, levels = Hospital_ID)
+  )
+
+figure_s1 <- ggplot(
+  figure_s1_data,
+  aes(x = Hospital_ID, y = Cases_Submitted)
+) +
+  geom_col(fill = "steelblue", width = 0.9) +
+  scale_y_continuous(
+    breaks = seq(0, 30, 10),
+    limits = c(0, 30),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    x = "Hospital",
+    y = "Number of cases"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_line(colour = "grey90"),
+    panel.grid.minor.x = element_blank(),
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  )
+
+print(figure_s1)
+
+ggsave(
+  "analysis_outputs/Figure_S1.pdf",
+  figure_s1,
+  width = 10,
+  height = 5.5
+)
+
+ggsave(
+  "analysis_outputs/Figure_S1.png",
+  figure_s1,
+  width = 10,
+  height = 5.5,
+  dpi = 300
+)
+```
+```{r}
+# FIGURE S2: Emergence time by propofol TCI model -----------------------------
+
+figure_s2_data <- known_technique %>%
+  filter(
+    anaesthesia == "TIVA",
+    pharma_prop %in% c("Eleveld", "Marsh", "Schnider"),
+    !is.na(timetowake)
+  ) %>%
+  mutate(
+    pharma_prop = factor(
+      pharma_prop,
+      levels = c("Eleveld", "Marsh", "Schnider")
+    )
+  )
+
+figure_s2 <- ggplot(
+  figure_s2_data,
+  aes(x = pharma_prop, y = timetowake, fill = pharma_prop)
+) +
+  geom_boxplot(width = 0.7, outlier.shape = 16) +
+  scale_fill_manual(
+    values = c(
+      "Eleveld" = "#F8766D",
+      "Marsh" = "#00BA38",
+      "Schnider" = "#619CFF"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 85)) +
+  labs(
+    x = "Propofol TCI model",
+    y = "Emergence time (min)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+
+print(figure_s2)
+
+ggsave(
+  "analysis_outputs/Figure_S2.pdf",
+  figure_s2, width = 8, height = 5.5
+)
+
+ggsave(
+  "analysis_outputs/Figure_S2.png",
+  figure_s2, width = 8, height = 5.5, dpi = 300
+)
+```
+
+
+
+
+```{r audit, include=FALSE}
+# 9. Audit and reproducibility ----------------------------------
+
+cohort_flow <- tibble(
+  step = c(
+    "Original responses",
+    "Both durations < 480 min",
+    "Excluded non-cranial spinal case",
+    "Eligible cranial cases",
+    "Known predominant maintenance technique"
+  ),
+  n = c(
+    nrow(source_data),
+    nrow(short_cases),
+    nrow(spinal_cases),
+    nrow(raw_data),
+    nrow(known_technique)
+  )
+)
+
+print(cohort_flow)
+
+write_csv(
+  cohort_flow,
+  "analysis_outputs/cohort_flow.csv"
+)
+
+writeLines(
+  capture.output(sessionInfo()),
+  "analysis_outputs/R_session_info.txt"
+)
+
+#Check cohort numbers
+print(cohort_flow)
+nrow(source_data)
+nrow(raw_data)
+nrow(known_technique)
+#Check main results
+print(table1, width = Inf)
+print(primary_emergence, width = Inf)
+#Check sensitivity analysis
+print(mixed_sensitivity, width = Inf)
+print(duration_sensitivity, width = Inf)
+# Audit checks for descriptive statistics reported in Results.
+# raw_data: 140 eligible cases
+# known_technique: 139 cases with known maintenance technique
+
+
+# 1. Overall surgical duration (all 140 cases) ----------------
+
+audit_duration <- summarise_numeric(
+  raw_data, "actual_duration"
+)
+
+print(audit_duration)
+
+stopifnot(
+  audit_duration$n_recorded == 136,
+  audit_duration$median == 540,
+  audit_duration$Q1 == 480,
+  audit_duration$Q3 == 660,
+  audit_duration$minimum == 308,
+  audit_duration$maximum == 1080
+)
+
+
+# 2. Reasons for anaesthetic choice (139 cases) ----------------
+
+audit_reasons <- known_technique %>%
+  summarise(
+    n = n(),
+    preference_n = sum(
+      grepl("Anaesthetist preference",
+            coalesce(anaesthetic_factors, ""))
+    ),
+    duration_n = sum(
+      grepl("Duration of surgery",
+            coalesce(surgical_factors, ""))
+    )
+  ) %>%
+  mutate(
+    preference_pct = round(100 * preference_n / n, 1),
+    duration_pct = round(100 * duration_n / n, 1)
+  )
+
+print(audit_reasons)
+
+stopifnot(
+  audit_reasons$n == 139,
+  audit_reasons$preference_n == 121,
+  audit_reasons$duration_n == 85,
+  audit_reasons$preference_pct == 87.1,
+  audit_reasons$duration_pct == 61.2
+)
+
+
+# 3. Postoperative ventilation and early CT (140 cases) -------
+
+audit_complications <- raw_data %>%
+  mutate(
+    ventilation = grepl(
+      "Need for prolonged ventilation",
+      coalesce(complications, "")
+    ),
+    ct = grepl(
+      "Need for CT in the first 6h post-op",
+      coalesce(complications, "")
+    )
+  ) %>%
+  summarise(
+    n = n(),
+    ventilation_n = sum(ventilation),
+    ct_n = sum(ct),
+    both_n = sum(ventilation & ct),
+    either_n = sum(ventilation | ct)
+  ) %>%
+  mutate(
+    either_pct = round(100 * either_n / n, 1)
+  )
+
+print(audit_complications)
+
+stopifnot(
+  audit_complications$n == 140,
+  audit_complications$ventilation_n == 7,
+  audit_complications$ct_n == 11,
+  audit_complications$both_n == 4,
+  audit_complications$either_n == 14,
+  audit_complications$either_pct == 10.0
+)
+
+
+# 4. Confirmation ---------------------------------------------
+
+message("Manuscript descriptive statistics: all audit checks passed.")
+```
+
+
+
+
+
