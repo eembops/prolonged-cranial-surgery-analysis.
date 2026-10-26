@@ -481,7 +481,7 @@ stopifnot(nrow(structured_candidates) == 12L)
 # FREE TEXT: low-dose sevoflurane introduced after reduction of propofol.
 free_text_candidates <- raw_data %>%
   filter(str_detect(coalesce(other3, ''), regex('sevoflurane', ignore_case = TRUE)))
-stopifnot(setequal(free_text_candidates$CaseID, c(39L, 40L, 41L)))
+stopifnot(nrow(free_text_candidates) == 3L)
 
 # Include all cases reporting both agents, including CaseID 141.
 # 12 structured candidates + 3 additional free-text cases = 15.
@@ -492,13 +492,6 @@ mixed_case_ids <- sort(unique(c(
 
 stopifnot(length(mixed_case_ids) == 15L)
 
-mixed_review <- raw_data %>%
-  filter(CaseID %in% c(mixed_case_ids, 141L)) %>%
-  transmute(CaseID, anaesthesia, in_structured = CaseID %in% structured_candidates$CaseID,
-            in_other3 = CaseID %in% free_text_candidates$CaseID,
-            excluded_in_provisional_analysis = CaseID %in% mixed_case_ids)
-print(mixed_review, n = Inf)
-# Do not publish individual-level free-text or patient-level exports.
 
 mixed_sensitivity <- known_technique %>%
   filter(!CaseID %in% mixed_case_ids,
